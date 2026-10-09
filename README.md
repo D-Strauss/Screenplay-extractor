@@ -1,188 +1,174 @@
-# Screenplay Extractor — Manuscript-to-Subtitle Pipeline
+# Screenplay Extractor
 
-Live theater captioning relies on an operator advancing subtitle lines in sync with actors on stage. But the input — a screenplay manuscript — is an unstructured document full of stage directions, scene headings, metadata, and formatting inconsistencies. Getting from raw PDF to a clean, ordered line list that an operator can actually use requires classification, normalization, and human review.
+**Turning theatre manuscripts into live subtitles, with a human in the loop where it counts.**
 
-Screenplay Extractor automates this. It ingests manuscripts (PDF, DOCX, TXT), classifies every line using an LLM, normalizes and flags anomalies, segments dialogue into subtitle-ready chunks, and presents the result for staff review — all through a web interface that handles the full lifecycle from upload to live performance.
+Screenplay Extractor reads a manuscript (PDF, DOCX or plain text), works out who says what, and produces a sequential list of subtitle lines that a technician steps through during a live performance. It was built for [Accessible Futures](https://accessiblefutures.se) to make theatre accessible to audiences who need text support, in Swedish and English, with optional translation.
 
-Built in Python. Designed for Swedish/English-language theater. Currently in MVP with real manuscripts in processing.
+> This repository is a public overview. Prompts, calibration values, evaluation data and customer manuscripts are intentionally not included.
 
 ---
 
-## Architecture Overview
+## The problem
+
+A theatre script is a messy document. Character names, stage directions, scene headings, songs and dialogue are all mixed together, and every playwright formats them differently. Subtitle operators need clean, correctly attributed, correctly sized lines, and a single wrong speaker or a stage direction shown to the audience breaks the experience.
+
+The goal is not just high accuracy. It is **accuracy you can trust**: when the system is unsure, it says so.
+
+## What it does
+
+| Input | Output |
+|---|---|
+| Manuscript as PDF, DOCX or TXT (including scanned PDFs via OCR) | Operator line list (JSON), SRT subtitles, optional translated versions, and a run manifest |
+
+```text
+CLAIRE                          { "id": 1, "type": "Dialogue",
+I thought you were taking  -->    "character": "Claire",
+out the garbage.                  "text": "I thought you were taking out the garbage.",
+                                  "flags": [] }
+(Dylan sits on the steps)  -->  (not shown to the audience)
+```
+
+---
+
+## Pipeline at a glance
 
 ```mermaid
-flowchart TB
-    subgraph Input["Upload"]
-        PDF["PDF / DOCX / TXT"]
-    end
+flowchart LR
+    A[Manuscript<br/>PDF · DOCX · TXT] --> B[Input handling<br/>text + font cues,<br/>Unicode normalisation]
+    B --> C[Character<br/>extraction]
+    C --> D[Fast first-pass<br/>classifier]
+    D --> E[LLM resolver<br/>only for uncertain lines]
+    E --> F[Post-processing<br/>cleanup · validation · flags]
+    F --> G[Translation<br/>optional]
+    G --> H[Subtitle<br/>segmentation]
+    H --> I[(JSON · SRT<br/>+ manifest)]
 
-    subgraph Pipeline["Classification Pipeline"]
-        IH["Text Extraction\n+ OCR Fallback"]
-        CD["Character Discovery\n(over-inclusive candidates)"]
-        LC["LLM Classification\n(Claude, temperature=0)"]
-        PP["Post-Processing\n(normalize, strip directions, flag)"]
-        CH["Subtitle Segmentation\n(42 CPL, 2-line events)"]
-    end
-
-    subgraph Review["Staff Review"]
-        RV["Correction UI\n(click-to-fix, inline edit)"]
-        CO["Character Ops\n(rename, merge, delete)"]
-        SM["State Machine\nPROCESSING → REVIEW → READY"]
-    end
-
-    subgraph Delivery["Live Performance"]
-        OP["Operator Viewer\n(advance lines)"]
-        AU["Audience Display\n(SSE-synced captions)"]
-    end
-
-    subgraph External["External Services"]
-        CLAUDE["Claude API"]
-        DEEPL["DeepL API"]
-    end
-
-    PDF --> IH --> CD --> LC --> PP --> CH
-    CH --> RV
-    RV --> OP
-    OP -.->|SSE| AU
-    CO --> RV
-    LC -->|classification| CLAUDE
-    PP -.->|optional translation| DEEPL
-
-    style Input fill:#1a1a2e,color:#eee,stroke:#e94560
-    style Pipeline fill:#16213e,color:#eee,stroke:#0f3460
-    style Review fill:#1a1a2e,color:#eee,stroke:#e94560
-    style Delivery fill:#16213e,color:#eee,stroke:#0f3460
-    style External fill:#1a1a2e,color:#eee,stroke:#e94560
+    classDef ai fill:#e8f0fe,stroke:#4a6fd8,color:#111
+    classDef det fill:#eef7ee,stroke:#4a9a5a,color:#111
+    class C,D,E ai
+    class B,F,G,H det
 ```
 
+Blue stages use AI models. Green stages are deterministic code.
 
+### Cascade classification: cheap first, smart when needed
+
+Most lines in a script are easy. Instead of sending everything to a large LLM, a fast specialised model labels every line and reports its confidence. Only the lines it is unsure about are escalated.
+
+```mermaid
+flowchart TD
+    L[Every line] --> J[First-pass model<br/>label + confidence]
+    J -->|confident| K[Accept label]
+    J -->|uncertain| R[LLM resolver<br/>sees surrounding context]
+    R --> K
+    K --> M{Still doubtful?}
+    M -->|yes| N[Keep label,<br/>attach a flag]
+    M -->|no| O[Clean element]
+```
+
+Why this shape:
+
+- **Cost and speed.** The expensive model only sees the hard cases.
+- **Swappable models.** Provider-specific code is isolated behind narrow seams, so both stages can be replaced by local models without touching the rest of the pipeline.
+- **Traceability.** Every run persists the first-pass draft, so any result can be inspected after the fact.
 
 ---
 
-## Key Design Decisions
+## Design principles
 
-### Over-Include, Then Prune
+### 1. Flag, don't guess
+Uncertain output is acceptable if it is *marked*. Wrong output with no flag is treated as a product failure. Flags such as `orphan_dialogue`, `unmatched_speaker` or `lyrics_uncertain` travel with each line into the review interface.
 
-The character discovery stage intentionally generates too many candidates — any uppercase pattern is a potential character name. This means scene headings (`INT. KITCHEN - DAY`), metadata (`SHOOTING DRAFT`), and camera directions (`ANGLE ON HOMER`) all become candidates.
+### 2. Typed boundaries between stages
+Stages never import each other. They exchange typed dataclasses and a single orchestrator wires them together, which keeps each stage independently testable.
 
-Why not filter these out with regex? Because every manuscript format introduces new uppercase conventions. Adding format-specific rules is whack-a-mole that eventually conflicts across documents.
+```mermaid
+flowchart LR
+    subgraph Stages
+        S1[Stage] -. typed dataclass .-> S2[Stage] -. typed dataclass .-> S3[Stage]
+    end
+    RUN[Runner / orchestrator] --> Stages
+    MODELS[(Shared models)] --- Stages
+```
 
-Instead, the LLM classifier decides what's actually a character vs. structural text. After classification, a pruning pass drops any candidate that never appeared as a speaker in a Cue or Dialogue element. The discoverer stays dumb and broad; the classifier is the authority.
+### 3. Reproducibility where it is possible, honesty where it is not
+LLM calls run at temperature 0 where supported. Where a model exposes no determinism controls, the project documents the measured run-to-run variation and persists each run's draft so results remain auditable. Regression tests use recorded output and never call live APIs.
 
-### Flag, Don't Guess
-
-When classification is uncertain, the system adds a flag — it never silently picks the most likely answer. Incorrect output *with* a flag is acceptable; incorrect output *without* a flag is a product failure.
-
-This inverts the usual ML instinct to maximize accuracy. In a human-in-the-loop pipeline, the cost of a silent wrong answer (operator reads the wrong line during a live show) vastly outweighs the cost of flagging something for review. The flag vocabulary is canonical — 15 named flags, each set by a specific stage, never invented ad-hoc.
-
-### Deterministic Pipeline
-
-LLM calls use `temperature=0`. All collections use stable sorting. Same input + same config = same output. This matters for debugging (reproduce the exact run) and for golden-file regression tests (diff the output).
-
-The runner snapshots all behavioral settings into a `manifest.json` per run (excluding secrets), so you can always answer "what config produced this output?"
-
-### Auto-Strip, Keep the Receipt
-
-Inline stage directions like `(to Claire)` buried inside dialogue would bleed through to subtitle output. The post-processor auto-strips these parentheticals, inserts them as separate Parenthetical elements, and sets a `may_contain_inline_direction` flag with metadata recording how many were stripped. Staff sees the flag during review and can verify correctness — the system cleaned up the mess but left a paper trail.
-
-### Subtitle-Aware Segmentation
-
-The chunker follows Netflix/Disney+ subtitle standards: 42 characters per line, 2-line events. Break priority: sentence boundary > clause boundary > comma > conjunction > safe word boundary. The system uses closed-class word lists (articles, prepositions, auxiliaries, pronouns) to avoid splitting syntactic units — never breaking `the dog` or `I'm not` across lines. No NLP model dependency; word lists cover the problem at a fraction of the complexity.
-
-### File-Based Everything
-
-No database. Manuscripts are JSON files, corrections are append-only JSONL, output artifacts live in versioned run directories. This keeps the system deployable without infrastructure, makes debugging trivial (read the files), and gives you version history for free (re-runs create new numbered directories, old manuscripts are archived with `superseded_by` links).
+### 4. Language-aware by default
+Swedish text has multiple Unicode representations for the same character, so everything is normalised once at the boundary. Subtitle segmentation follows broadcast subtitle conventions (line length limits, two-line events, linguistically sensible break points) with language-specific rules for English and Swedish.
 
 ---
 
-## System Design
+## From pipeline to production workflow
 
+The pipeline is one half of the system. The other half is a review workflow so staff can correct and approve results before anything reaches a customer.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PROCESSING: upload
+    PROCESSING --> REVIEW_PENDING: pipeline finished
+    REVIEW_PENDING --> READY: staff approve
+    READY --> ARCHIVED: production finished
 ```
+
+```mermaid
+flowchart LR
+    U[Upload portal] --> P[Pipeline run]
+    P --> RV[Review interface<br/>source context + flags]
+    RV -->|corrections| LOG[(Append-only<br/>correction log)]
+    RV -->|approve| D[Delivery]
+    D --> V[Operator viewer<br/>live show]
+    DASH[Dashboard<br/>queue + SLA deadlines] --- RV
+```
+
+- **Review interface** shows each element next to its source text and flags, and records every correction by category (wrong type, wrong speaker, split error, and so on).
+- **Correction log** is append-only, giving a dataset for measuring and improving the classifier.
+- **Dashboard** tracks the queue against standard and urgent delivery tiers.
+- **Operator viewer** presents lines for live advancement during a show.
+
+---
+
+## Quality approach
+
+- **Golden-file regression tests** built from manuscripts that were delivered with zero corrections.
+- **Invariant checks** in post-processing (for example, no dialogue without a speaker, characters only kept if they actually speak).
+- **LLM-as-judge tooling** for evaluating reference labels, paired with a written register of known judge failure modes and how each one is detected.
+- **Strict static analysis**: Ruff, mypy with a strict configuration, and a test suite that mirrors the source tree.
+- **Structured logging** with per-document context and no manuscript text or secrets in production logs.
+
+---
+
+## Tech stack
+
+| Area | Tools |
+|---|---|
+| Language & tooling | Python 3.12, uv, Ruff, mypy, pytest |
+| Web | FastAPI, Uvicorn, Jinja2 (server-rendered, no JS framework) |
+| Data modelling | pydantic v2, dataclasses, versioned JSON Schema |
+| Document extraction | pdfplumber, python-docx, Tesseract OCR |
+| AI | Anthropic Claude API, a specialised first-pass decision model, DeepL for translation |
+| Observability | structlog |
+
+## Repository layout (high level)
+
+```text
 src/screenplay_extractor/
-├── config.py        Settings (pydantic-settings, SE_ prefix, .env)
-├── logging.py       structlog with contextvars (document_id, pipeline_stage)
-├── models/          Typed dataclasses — shared vocabulary across all layers
-├── pipeline/        Isolated stages + runner orchestrator + versioned prompts
-├── review/          State machine + correction logic (service) / file I/O (storage)
-├── api/             FastAPI, Jinja2 templates, vanilla CSS/JS — no framework
-└── schemas/         Versioned JSON Schema contracts (immutable once published)
+    pipeline/    stage modules + versioned prompt builders
+    models/      typed domain models
+    review/      review business logic and storage
+    api/         upload, review, dashboard and viewer routes
+    schemas/     versioned output schemas
+tests/           mirrors src/
+tools/           developer utilities (evaluation, replay)
 ```
 
-Each pipeline stage is a standalone module with a single public function. Stages never import each other — the runner is the only module that wires them together. This means any stage can be tested, replaced, or rewritten without touching the rest of the pipeline.
+## What I'd highlight
 
-The web layer is deliberately thin: route handlers delegate to `review.service` for business logic and `pipeline.runner` for processing. Templates are server-rendered Jinja2 with no JS framework — the operator viewer uses vanilla JS + Server-Sent Events for real-time sync between control and audience displays.
-
----
-
-## Data Flow
-
-```mermaid
-sequenceDiagram
-    participant Staff as Staff
-    participant Web as Web UI
-    participant Pipe as Pipeline
-    participant FS as File System
-
-    Staff->>Web: Upload manuscript
-    Web->>Pipe: Run pipeline
-    Pipe->>FS: Write classified elements, operator lines, SRT, manifest
-    Web-->>Staff: Redirect to review
-
-    loop Corrections
-        Staff->>Web: Fix misclassified elements
-        Web->>FS: Patch classified.json + append correction log
-    end
-
-    Staff->>Web: Approve
-    Web->>FS: Write review summary
-    Note over Staff,FS: Manuscript is READY for performance
-
-    Staff->>Web: Open operator viewer
-    Web-->>Staff: Live line advancement + audience display (SSE)
-```
-
-
+- Designing an **uncertainty-aware** LLM pipeline where flags are a first-class output.
+- A **cost-aware cascade** that routes only hard cases to a larger model, built so models can be swapped for local ones.
+- A full **human-in-the-loop product** around the pipeline: states, review, audit trail, SLAs.
+- Handling **real-world document mess** (fonts, OCR, Swedish text) with typed, testable stages.
 
 ---
 
-## Technical Highlights
-
-- **LLM classification with structured output** — Claude classifies lines into 8 element types with character attribution; responses parsed as JSON with fallback flagging on parse failure
-- **Multi-pass post-processing** — normalize characters (3-tier: exact match → variant recovery → flag), strip inline directions, check invariants, clean subtitle-unsafe symbols — each pass independently testable
-- **Dialogue merge before segmentation** — consecutive same-speaker dialogue lines (split across PDF lines) are merged before chunking to produce natural subtitle events
-- **OCR pipeline** — Tesseract fallback for image-only PDFs with pipe-character stripping, no-alpha line filtering, and parameterized header detection (template-matching for headers with embedded page numbers)
-- **Append-only correction log** — every staff edit is recorded as a JSONL entry with category, timestamp, and before/after state; enables future data-driven automation (Phase 3 roadmap)
-- **Operator viewer** — dual-view SSE architecture: operator advances lines on a control display, audience display follows in real time via server-sent events
-- **Versioned everything** — prompts, output schemas, and run artifacts are versioned; published schemas are never mutated
-
----
-
-## Tech Stack
-
-
-| Layer              | Technology                               |
-| ------------------ | ---------------------------------------- |
-| Language           | Python 3.12                              |
-| Package management | uv (lockfile committed)                  |
-| Web                | FastAPI + Uvicorn, Jinja2, vanilla JS    |
-| Validation         | pydantic v2, pydantic-settings           |
-| LLM                | Anthropic Claude API                     |
-| Translation        | DeepL API                                |
-| PDF extraction     | pdfplumber + pytesseract (OCR fallback)  |
-| DOCX extraction    | python-docx                              |
-| Logging            | structlog (structured, contextvar-bound) |
-| Testing            | pytest + pytest-asyncio, httpx           |
-| Linting            | Ruff (lint + format), mypy (strict)      |
-
-
----
-
-## Status
-
-In use — processing real Swedish theater manuscripts with staff review. Pipeline, review system, and operator viewer are functional.
-
----
-
-*Built as part of an accessibility initiative to bring real-time captioning to Swedish-language theater.*
-
-Built by Dahni Strauss at [Accessible Futures AB](https://accessiblefutures.se).
+*Built by Accessible Futures. Contact: see GitHub profile.*
